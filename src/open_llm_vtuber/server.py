@@ -8,8 +8,10 @@ It uses FastAPI for the server and Starlette for static file serving.
 
 import os
 import shutil
+from pathlib import Path
 
 from fastapi import FastAPI
+from loguru import logger
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 from starlette.staticfiles import StaticFiles as StarletteStaticFiles
@@ -17,6 +19,13 @@ from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 from .routes import init_client_ws_route, init_webtool_routes, init_proxy_route
 from .service_context import ServiceContext
 from .config_manager.utils import Config
+
+# Optional: catalog builder (skip gracefully if missing in older installs)
+try:
+    from .items_catalog import build_items_catalog
+except ModuleNotFoundError:  # pragma: no cover - safety fallback
+    def build_items_catalog(*args, **kwargs):
+        return []
 
 
 # Create a custom StaticFiles class that adds CORS headers
@@ -50,6 +59,54 @@ class AvatarStaticFiles(CORSStaticFiles):
         if not any(path.lower().endswith(ext) for ext in allowed_extensions):
             return Response("Forbidden file type", status_code=403)
         response = await super().get_response(path, scope)
+        return response
+
+
+class ModelFilteredStaticFiles(CORSStaticFiles):
+    """
+    Static files handler that blocks PNGs inside any directory (or subdirectory)
+    containing a Live2D model definition (e.g., model3.json/model.json).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._model_dirs = self._compute_model_dirs()
+
+    def _compute_model_dirs(self):
+        model_dirs = set()
+        root = Path(self.directory).resolve()
+        for dirpath, dirnames, filenames in os.walk(root):
+            if any(
+                name.lower().endswith("model3.json") or ("model" in name.lower() and name.lower().endswith(".json"))
+                for name in filenames
+            ):
+                model_dirs.add(Path(dirpath))
+                # Do not prune dirnames; descendants remain blocked via ancestor check
+        return model_dirs
+
+    def _is_blocked_png(self, fs_path: Path) -> bool:
+        if fs_path.suffix.lower() != ".png":
+          return False
+        try:
+          resolved = fs_path.resolve()
+        except FileNotFoundError:
+          return False
+        for model_dir in self._model_dirs:
+            try:
+                resolved.relative_to(model_dir)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+
+        if response.status_code == 200:
+            fs_path_str, _ = self.lookup_path(path)
+            if fs_path_str and self._is_blocked_png(Path(fs_path_str)):
+                return Response(status_code=404)
+
         return response
 
 
@@ -117,6 +174,29 @@ class WebSocketServer:
             name="cache",
         )
 
+        # Regenerate items catalog on startup (used by frontend fallback)
+        try:
+            # Resolve project root: server.py -> open_llm_vtuber -> src -> PROJECT ROOT
+            project_root = Path(__file__).resolve().parents[2]
+            items_dir = project_root / "live2d-models" / "items"
+
+            logger.info(
+                f"[ItemsCatalog] project_root={project_root}, "
+                f"items_dir={items_dir}, exists={items_dir.exists()}"
+            )
+
+            built = build_items_catalog(
+                base_dir=str(items_dir),
+                url_prefix="/live2d-models/items",
+            )
+
+            logger.info(
+                f"[ItemsCatalog] Live2D items catalog generated with "
+                f"{len(built)} entries at {items_dir}"
+            )
+        except Exception as exc:  # pragma: no cover - best-effort
+            logger.exception(f"[ItemsCatalog] Generation skipped/failed: {exc}")
+            
         # Mount static files with CORS-enabled handlers
         self.app.mount(
             "/live2d-models",
